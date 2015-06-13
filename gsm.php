@@ -570,6 +570,29 @@ class GSM {
 	}
 	
 	/**
+	 * Get the current power status & battery level
+	 *
+	 * @return array ['Level' => 0-100, 'Status' => 'On Battery']
+	 **/
+	public function getBatteryLevel() {
+		$res = $this->send('AT+CBC');
+
+		if(preg_match('/\+CBC:\s*(\d+),(\d+)/', $res, $match)) {
+			list(,$status,$level) = $match;
+			
+			$out = array('Level' => $level);
+			switch($status) {
+				case 0: $out['Status'] = 'On Battery'; break;
+				case 1: $out['Status'] = 'Plugged In'; break;
+				case 2: $out['Status'] = 'No Battery'; break;
+				default: $out['Status'] = 'Power Fault'; break;
+			}
+			
+			return $out;
+		}
+	}
+	
+	/**
 	 * Sets the character set for communication
 	 *
 	 * Currently supported: GSM, ASCII
