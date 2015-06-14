@@ -28,6 +28,16 @@ class GSM {
 	protected $debug;
 	
 	/**
+	 * Map to convert from GSM 7-bit charset to ISO-8859-1
+	 **/
+	protected $gsm_to_iso;
+
+	/**
+	 * Map to convert to GSM 7-bit charset from ISO-8859-1
+	 **/
+	protected $iso_to_gsm;
+	
+	/**
 	 * Map of Code => Friendly Name for Phonebook storage areas
 	 * 
 	 * @access private
@@ -170,7 +180,7 @@ class GSM {
 	 *
 	 * @param string (unread|unsent|read|sent|all) Message status to filter by
 	 *
-	 * @return array ["Storage Name' => <listSMS>]
+	 * @return array ["Storage Name' => listSMS($store)]
 	 *
 	 * @example gsmexamples.php 17 7 List all messages on the device
 	 **/
@@ -219,13 +229,12 @@ class GSM {
 	 * @example gsmexamples.php 31 2 Send a simple text message
 	 **/
 	public function sendSMS($number, $msg) {
-		if($this->charset == 'GSM') {
-			$msg = GsmEncoder::utf8_to_gsm0338($msg);
-			$msg = GsmEncoder::pack7bit($msg);
+		$res = $this->send("AT+CMGS=\"{$number}\"\n{$msg}" . chr(26), 0.4);
+		if(preg_match('/\+CMS ERROR:\s*(\d+)/', $res, $match)) {
+			throw new GSMException("Sending message failed with code {$match[1]}");
 		}
 		
-		$res = $this->send("AT+CMGS=\"{$number}\"\n{$msg}\n" . chr(26), 0.5);
-		if(preg_match('/\+CMGS:\s*(\d+)/', $res, $match)) {
+		if(preg_match('/\+CMGS:\s*(\d+)$/m', $res, $match)) {
 			list(, $reference) = $match;
 			return $reference;
 		}
@@ -361,6 +370,7 @@ class GSM {
 		$res = $this->send('AT+CPBS?');
 		if(preg_match('/\+CPBS:\s*"(\w+)",(\d+),(\d+)/', $res, $match)) {
 			list(, $selectedStore, $entries, $limit) = $match;
+			
 			if($selectedStore != $phonebook)
 				throw new GSMException('Failed to select Phonebook ' . $phonebook . (isset($this->phonebookStores[$phonebook]) ? '(' . $this->phonebookStores[$phonebook] . ')' : ''));
 			
@@ -383,7 +393,7 @@ class GSM {
 				if(preg_match('/\+CPBR:\s*(\d+),"([^"]*)",(\d+),"([^"]*)"/', $entry, $match)) {
 					list(, $index, $number, $type, $name) = $match;
 					$out[] = array('Name'=>$name,'Number'=>$number,'Index'=>$index,'Type'=>$type);
-				} else {
+				} elseif(trim($entry) && $entry != 'OK') {
 					throw new GSMException('Invalid Phonebook entry ' . $entry);
 				}
 			}
@@ -417,14 +427,18 @@ class GSM {
 	/**
 	 * Lists the entries in all phonebooks
 	 *
-	 * @return array ["Phonebook Name" => <listPhonebook>]
+	 * @return array ["Phonebook Name" => listPhonebook($store)]
 	 *
 	 * @example gsmexamples.php 74 6 Lists all the contacts on the device
 	 **/
 	public function listAllPhonebooks() {
 		$out = array();
 		foreach($this->listPhonebooks() as $phonebook => $name) {
-			if($store == 'MT') continue;
+			if($phonebook == 'MT') continue;
+			try {
+				$out[$name] = $this->listPhonebook($phonebook);
+			} catch (GSMException $e) {
+			}
 			$out[$name] = $this->listPhonebook($phonebook);
 		}
 		return $out;
@@ -631,6 +645,36 @@ class GSM {
 		if(!class_exists('phpserial'))
 			require(__DIR__ . '/phpserial.php');
 
+		$this->gsm_to_iso = array_merge(
+			array(
+				"\x00" => '@',
+				"\x01" => "\xA3",
+				"\x02" => "$",
+				"\x03" => "\xA5",
+				"\x04" => "\xE8",
+				"\x05" => "\xE9",
+				"\x06" => "\xF9",
+				"\x07" => "\xEC",
+				"\x08" => "\xF2",
+				"\x09" => "\xC7",
+				"\x0A" => "\n",
+				"\x0B" => "\xD8",
+				"\x0C" => "\xBA",
+				"\x0D" => "\r",
+				"\x0E" => "\xC5",
+				"\x0F" => "\xE5",
+			),
+			// \x10 - \x1F
+			array_combine(range("\x20", "\x3F"), range("\x20", "\x3F")),
+			// \x40
+			array_combine(range("\x41", "\x5A"), range("\x41", "\x5A")),
+			// \x5B - \x60
+			array_combine(range("\x61", "\x7A"), range("\x61", "\x7A"))
+			// \x7B - \x7F
+		);
+		
+		$this->iso_to_gsm = array_flip($this->gsm_to_iso);
+		
 		$serial = $this->serial = new phpserial;
 		
 		$serial->deviceSet($device);
@@ -649,7 +693,7 @@ class GSM {
 		}
 		
 		$this->send('AT+CMGF=1');
-		$this->setCharset('ASCII');
+		$this->setCharset('GSM');
 	}
 	
 	public function __destruct() {
@@ -663,17 +707,26 @@ class GSM {
 	 * @param float Delay to wait for response (in seconds)
 	 **/
 	protected function send($msg, $delay=0.05) {
-		if(substr($msg, -2) != "\r\n") $msg .= "\r\n";
+		if(substr($msg, -1) != "\n") $msg .= "\n";
 		
 		if($this->debug) echo ">{$msg}";
+
+		if($this->charset == 'GSM')
+			$msg = strtr($msg, $this->iso_to_gsm);
 		
 		$this->serial->sendMessage($msg, $delay);
-		$response = trim($this->serial->readPort());
+		$response = $this->serial->readPort();
+		
+		if($this->charset == 'GSM')
+			$response = strtr($response, $this->gsm_to_iso);
+
 		$response = preg_replace('/\n\s*\n/', "\n", $response);
-		
-		if($this->debug && trim($response))
-			echo "<" . str_replace("\n", "\n<", $response) . "\n";
-		
+
+		if($this->debug) {
+			$debug = trim(str_replace(array("> \n", "\n"), array('', "\n<"), $response));
+			if($debug) echo "<" . $debug . "\n";
+		}
+
 		if($response == 'OK') return true;
 		if($response == 'ERROR') throw new GSMException($msg . ' returned ' . $response);
 		if(substr($response, -2) == 'OK') return trim(substr($response,0,-2));
